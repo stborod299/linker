@@ -1,3 +1,3 @@
 module github.com/logrange/linker
 
-go 1.13
+go 1.21

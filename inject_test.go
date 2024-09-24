@@ -17,6 +17,7 @@ package linker
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -66,7 +67,7 @@ func TestInjectDifferentFields(t *testing.T) {
 		Component{Name: "strVal", Value: "test"},
 	)
 
-	inj.Init(nil)
+	inj.Init(context.TODO())
 
 	if a.IntVal != 33 || a.InfI != bp || a.StrVal != "test" || a.StructB != bb || a.StructBPtr != bp {
 		t.Fatal("Struct A is not properly initialized: ", a)
@@ -79,8 +80,7 @@ func TestInterface(t *testing.T) {
 
 	a := &A{}
 	bp := &b{10}
-	var inf I
-	inf = bp
+	var inf I = bp
 	inj.Register(Component{Name: "AA", Value: a},
 		Component{Name: "infVal", Value: inf},
 		Component{Name: "intVal", Value: int(123)},
@@ -88,7 +88,7 @@ func TestInterface(t *testing.T) {
 		Component{Name: "strVal", Value: "test"},
 	)
 
-	inj.Init(nil)
+	inj.Init(context.TODO())
 
 	if a.IntVal != 123 || a.InfI != bp || a.StructBPtr != bp {
 		t.Fatal("Struct A is not properly initialized: ", a)
@@ -103,8 +103,7 @@ func TestAmbiguousInit(t *testing.T) {
 	inj.SetLogger(stdLogger{})
 
 	bp := &b{10}
-	var inf I
-	inf = bp
+	var inf I = bp
 	bp1 := &b{10}
 
 	inj.Register(
@@ -113,7 +112,7 @@ func TestAmbiguousInit(t *testing.T) {
 		Component{Name: "certain", Value: inf},
 		Component{Name: "", Value: bp1},
 	)
-	catchPanic(t, "Ambiguous component assignment for the field InfI with type", func() { inj.Init(nil) })
+	catchPanic(t, "Ambiguous component assignment for the field", func() { inj.Init(context.TODO()) })
 }
 
 func TestOptional(t *testing.T) {
@@ -121,13 +120,12 @@ func TestOptional(t *testing.T) {
 	inj.SetLogger(stdLogger{})
 
 	bp := &b{10}
-	var inf I
-	inf = bp
+	var inf I = bp
 
 	inj.Register(
 		Component{Name: "", Value: inf},
 	)
-	inj.Init(nil)
+	inj.Init(context.TODO())
 	if bp.IntVal != 33 {
 		t.Fatal("must be initialized by 33, but it is ", bp)
 	}
@@ -146,7 +144,7 @@ func TestOptionalPanics(t *testing.T) {
 		Component{Name: "", Value: &WrongDedault{}},
 	)
 
-	catchPanic(t, "Could not assign the default value=\"1..23\" to the field FloatVal ", func() { inj.Init(nil) })
+	catchPanic(t, "could not assign the default value=\"1..23\" to the field FloatVal", func() { inj.Init(context.TODO()) })
 }
 
 func TestOptionalFloatOk(t *testing.T) {
@@ -158,7 +156,7 @@ func TestOptionalFloatOk(t *testing.T) {
 		Component{Name: "wrongDefault", Value: float32(1.22)},
 		Component{Name: "", Value: wd},
 	)
-	inj.Init(nil)
+	inj.Init(context.TODO())
 
 	if wd.FloatOkVal != float32(1.23) || wd.FloatVal != float32(1.22) {
 		t.Fatal("Something wrong with ", wd)
@@ -178,7 +176,7 @@ func TestStringOptional(t *testing.T) {
 	inj.Register(
 		Component{Name: "", Value: so},
 	)
-	inj.Init(nil)
+	inj.Init(context.TODO())
 	if so.StringVal != "abc" {
 		t.Fatal("must be initialized by 33, but it is ", so)
 	}
@@ -195,7 +193,7 @@ func TestCycleSelfReffered(t *testing.T) {
 	inj.Register(
 		Component{Name: "", Value: &SelfReffered{}},
 	)
-	catchPanic(t, "Found a loop in the object graph dependencies.", func() { inj.Init(nil) })
+	catchPanic(t, "Found a loop in the object graph dependencies.", func() { inj.Init(context.TODO()) })
 }
 
 type Looper1 struct {
@@ -219,7 +217,7 @@ func TestLoops(t *testing.T) {
 		Component{Name: "", Value: &Looper2{}},
 		Component{Name: "", Value: &Looper3{}},
 	)
-	catchPanic(t, "Found a loop in the object graph dependencies.", func() { inj.Init(nil) })
+	catchPanic(t, "Found a loop in the object graph dependencies.", func() { inj.Init(context.TODO()) })
 }
 
 type CompCycle1 struct {
@@ -253,10 +251,7 @@ func (cc *CompCycle1) PostConstruct() {
 
 func (cc *CompCycle1) Init(ctx context.Context) error {
 	if cc.waitCtx {
-		select {
-		case <-ctx.Done():
-
-		}
+		<-ctx.Done()
 		return ctx.Err()
 	}
 	cc.init = *cc.refCnt
@@ -343,7 +338,7 @@ func TestCompCycle(t *testing.T) {
 		Component{Name: "", Value: cc3},
 	)
 
-	inj.Init(nil)
+	inj.Init(context.TODO())
 	if cc3.init != 1 || cc2.init != 2 || cc1.init != 3 {
 		t.Fatal("Wrong init order ", cc1, cc2, cc3)
 	}
@@ -375,7 +370,7 @@ func TestInitCycleFailed(t *testing.T) {
 
 	cc2.err = fmt.Errorf("Tra ta ta")
 
-	catchPanic(t, "", func() { inj.Init(nil) })
+	catchPanic(t, "", func() { inj.Init(context.TODO()) })
 	if cc3.init != 1 || cc2.init != 2 || cc1.init != 0 {
 		t.Fatal("Wrong init order ", cc1, cc2, cc3)
 	}
@@ -410,7 +405,7 @@ func TestInitCycleClosedCtx(t *testing.T) {
 
 	cc1.waitCtx = true
 	catchPanic(t, "", func() { inj.Init(ctx) })
-	if time.Now().Sub(start) < 5*time.Millisecond {
+	if time.Since(start) < 5*time.Millisecond {
 		t.Fatal("expecting at least 5ms")
 	}
 
@@ -441,7 +436,7 @@ func TestFuncInject(t *testing.T) {
 	a := 0
 	inj.Register(
 		Component{Name: "", Value: wf},
-		Component{Name: "", Value: func() {a++}},
+		Component{Name: "", Value: func() { a++ }},
 	)
 	inj.Init(context.Background())
 	wf.Func()
@@ -467,6 +462,104 @@ func TestMapInject(t *testing.T) {
 	res := wm.Map["aaa"]
 	if res != "bbbb" {
 		t.Fatal("map must be injected with no problem")
+	}
+}
+
+func TestFactoryPanicNotAFunction(t *testing.T) {
+	inj := New()
+	inj.SetLogger(stdLogger{})
+	inj.Register(
+		Component{Name: "", Value: int(10)},
+		Component{Name: "", Value: "hello"},
+		&FComponent{Function: 6},
+	)
+	catchPanic(t, "", func() { inj.Init(context.Background()) })
+}
+
+func TestFactoryPanicErrorResult(t *testing.T) {
+	inj := New()
+	inj.SetLogger(stdLogger{})
+
+	factory := func(i int, s string) (*WithMap, error) {
+		return nil, os.ErrDeadlineExceeded
+	}
+
+	inj.Register(
+		Component{Name: "", Value: int(10)},
+		Component{Name: "", Value: "hello"},
+		&FComponent{Function: factory},
+	)
+	catchPanic(t, "", func() { inj.Init(context.Background()) })
+}
+
+func TestFactoryProduce(t *testing.T) {
+	inj := New()
+	inj.SetLogger(stdLogger{})
+
+	wm := &WithMap{}
+	factory := func(i int, s string) *WithMap {
+		wm.Map = map[string]interface{}{
+			"i": i,
+			"s": s,
+		}
+		return wm
+	}
+
+	inj.Register(
+		Component{Name: "", Value: int(10)},
+		Component{Name: "", Value: "hello"},
+		FComponent{Function: factory},
+	)
+	inj.Init(context.Background())
+	res := wm.Map["i"]
+	if res != 10 {
+		t.Fatal("map must have i=10")
+	}
+	res = wm.Map["s"]
+	if res != "hello" {
+		t.Fatal("map must have s=`hello`")
+	}
+}
+
+func TestFactoryInjects(t *testing.T) {
+	inj := New()
+	inj.SetLogger(stdLogger{})
+
+	wm := &WithMap{}
+	factoryMap := func(i int, s string) *WithMap {
+		wm.Map = map[string]interface{}{
+			"i": i,
+			"s": s,
+		}
+		return wm
+	}
+	factoryFunc := func(in *WithMap) *WithFunc {
+		in.Map["done"] = true
+		return &WithFunc{
+			Func: func() {
+			},
+		}
+	}
+
+	inj.Register(
+		Component{Name: "", Value: int(10)},
+		Component{Name: "", Value: "hello"},
+		FComponent{Function: factoryFunc},
+		FComponent{Function: factoryMap},
+	)
+	inj.Init(context.Background())
+	res := wm.Map["i"]
+	if res != 10 {
+		t.Fatal("map must have i=10")
+	}
+	res = wm.Map["s"]
+	if res != "hello" {
+		t.Fatal("map must have s=`hello`")
+	}
+
+	res = wm.Map["done"]
+	if res != true {
+		t.Fatal("map must have s=`hello`")
 	}
 }
 

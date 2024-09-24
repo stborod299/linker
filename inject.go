@@ -16,11 +16,9 @@ package linker
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"reflect"
 	"sort"
-	"strconv"
 	"time"
 )
 
@@ -72,6 +70,41 @@ type (
 		iComps []*component
 	}
 
+	// Dependency describes component dependency.
+	Dependency struct {
+		// Name of the dependency component
+		Name string
+
+		// Type of the component value
+		Type reflect.Type
+
+		// True if component value may be omitted
+		Optional bool
+
+		// Value which should be used in case of omitted component value
+		// It's optional. In case if optional component is missed and no default value set - nil will be passed
+		// to component produce. Component is responsible to handle this nil
+		Default any
+	}
+
+	// ComponentIF describes component in terms of relations with other components
+	ComponentIF interface {
+		// GetName returns name of the component or empty string if component doensn't have name
+		GetName() string
+
+		// Produce returns instance of the components according to resolved values of dependencies
+		Produce([]any) any
+
+		// Returns list of component dependencies
+		In() []Dependency
+
+		// Out returns type of the value provided by component
+		Out() reflect.Type
+
+		// Identity returns unique value of container. It's used to prevent repetitive registration
+		Identity() any
+	}
+
 	// PostConstructor interface. Components can implement it to provide a post-
 	// construct action (see PostConstruct).
 	PostConstructor interface {
@@ -116,16 +149,6 @@ type (
 		Shutdown()
 	}
 
-	// Component struct wraps a component, which is placed into Value field. The
-	// struct is used for registering components in Injector.
-	Component struct {
-		// Name contains the component name
-		Name string
-
-		// Value contains the component which is registered in the Injector
-		Value interface{}
-	}
-
 	// Logger interface is used by Injector to print its logs
 	Logger interface {
 		// Info prints an information message into the log
@@ -140,8 +163,10 @@ type (
 		value     interface{}
 		tp        reflect.Type
 		val       reflect.Value
-		deps      map[*component]bool
+		deps      map[*component]struct{}
 		initOrder int
+		comp      ComponentIF
+		depSlice  []*component
 	}
 
 	nullLogger struct {
@@ -173,26 +198,26 @@ func (i *Injector) SetLogger(log Logger) {
 
 // Register called to register programming components. It must be called before
 // Init().
-func (i *Injector) Register(comps ...Component) {
+func (i *Injector) Register(comps ...ComponentIF) {
 	for _, c := range comps {
-		val := reflect.ValueOf(c.Value)
+		val := c.Identity()
 		pc, ok := i.comps[val]
 		if !ok {
 			// well, we don't have the wrapper yet, creating a new one
 			pc = new(component)
 			i.comps[val] = pc
-			pc.value = c.Value
-			pc.tp = reflect.TypeOf(c.Value)
-			pc.val = reflect.ValueOf(c.Value)
+			pc.comp = c
+			pc.tp = c.Out()
 		}
 
-		i.log.Info("Registering component with type ", pc.tp, " as \"", c.Name, "\"")
+		name := c.GetName()
+		i.log.Info("Registering component with type ", pc.tp, " as \"", name, "\"")
 
-		if c.Name != "" {
-			if _, ok := i.named[c.Name]; ok {
-				i.panic("Register(): the name " + c.Name + " already registered.")
+		if name != "" {
+			if _, ok := i.named[name]; ok {
+				i.panic("Register(): the name " + name + " already registered.")
 			}
-			i.named[c.Name] = pc
+			i.named[name] = pc
 		}
 	}
 }
@@ -208,22 +233,27 @@ func (i *Injector) Register(comps ...Component) {
 // properly
 func (i *Injector) Init(ctx context.Context) {
 	i.log.Info("Init(): ", len(i.comps), " components are going to be initialized, ", len(i.named), " names are registered.")
-	for _, c := range i.comps {
-		i.initStructPtr(c)
-	}
 
-	// setting up init order and call PostConstruct
+	// Resolve dependencies and fill them inside components
+	i.resoveDependencies()
+
+	// setting up init order via components list sort
 	iList := make([]*component, 0, len(i.comps))
 	for _, c := range i.comps {
 		if c.getInitOrder() <= 0 {
 			i.panic("Internal error, init order should be positive, but the component has wrong one " + c.String())
 		}
 		iList = append(iList, c)
+	}
+	sort.Slice(iList, func(i int, j int) bool { return iList[i].getInitOrder() < iList[j].getInitOrder() })
+
+	// Produce all components and inject all values
+	for _, c := range iList {
+		c.construct()
 		c.postConstruct(i.log)
 	}
 
-	// sort components and call for Init()
-	sort.Slice(iList, func(i int, j int) bool { return iList[i].getInitOrder() < iList[j].getInitOrder() })
+	// Now we're ready to init
 	i.iComps = make([]*component, 0, len(iList))
 	for idx, c := range iList {
 		err := c.init(ctx, i.log)
@@ -256,39 +286,38 @@ func (i *Injector) Shutdown() {
 	i.log.Info("Shutdown(): done.")
 }
 
-// assignOrPanic assigns value for the field with index fi according to the tagInfo provided.
-// The function panics on any error related to the assignment.
-func (i *Injector) assignOrPanic(c *component, fi int, tagInfo parseRes) {
-	f := c.val.Elem().Field(fi)
-	fType := f.Type()
-	fName := c.tp.Elem().Field(fi).Name
+func (i *Injector) resoveDependencies() {
+	for _, c := range i.comps {
+		in := c.comp.In()
 
-	compName := tagInfo.val
-	if compName != "" {
-		c1, ok := i.named[compName]
-		if !ok {
-			if tagInfo.optional {
-				err := setFieldValueByString(f, tagInfo.defVal)
-				if err != nil {
-					i.panic(fmt.Sprintf("Could not assign the default value=\"%s\" to the field %s (with type %s) in the type %s.",
-						tagInfo.defVal, fName, fType, c.tp))
+		for _, inDep := range in {
+			dep := i.lookup(inDep.Name, inDep.Type)
+			if dep == nil {
+				if !inDep.Optional {
+					panic(fmt.Sprintf("Can't lookup component for %s:%s", inDep.Name, inDep.Type))
 				}
-
-				i.log.Info("Field #", fi, "(", fName, "): the component name ", compName, ", is not found, but the field population is optional. Skipping the value. ")
-				return
 			}
-			i.panic(fmt.Sprintf("Could not set field %s in type %s, cause no component with such name(%s) was found.", fName, c.tp, compName))
+			// Unresolved optional dependencies will be added as nils
+			c.addDep(dep)
+		}
+	}
+}
+
+// lookup performs component lookup via registry of components.
+// It returns nil in case if lookup didn't have success or best candidate component on success.
+func (i *Injector) lookup(name string, fType reflect.Type) *component {
+	if name != "" {
+		c1, ok := i.named[name]
+		if !ok {
+			// TODO: panic?
+			return nil
 		}
 
 		if !c1.tp.AssignableTo(fType) {
-			i.panic(fmt.Sprintf("Component named %s of type %s is not assignable to field %s (with type %s) in %s.",
-				compName, c1.tp, fName, fType, c.tp))
+			i.panic(fmt.Sprintf("Requested component %s:%s but resolved to incompatible type %s", name, fType, c1.tp))
 		}
 
-		f.Set(c1.val)
-		c.addDep(c1)
-		i.log.Debug("Field #", fi, "(", fName, "): Populating the field in type ", c.tp, " by the component ", c1.tp)
-		return
+		return c1
 	}
 
 	// search for a assignable type to the field
@@ -297,64 +326,12 @@ func (i *Injector) assignOrPanic(c *component, fi int, tagInfo parseRes) {
 		if uc.tp.AssignableTo(fType) {
 			if found != nil {
 				i.panic(fmt.Sprintf("Ambiguous component assignment for the field %s with type %s in the type %s. Both unnamed components %s and %s, matched to the field.",
-					fName, fType, c.tp, found.tp, uc.tp))
+					name, fType, fType, found.tp, uc.tp))
 			}
 			found = uc
 		}
 	}
-
-	if found != nil {
-		f.Set(found.val)
-		c.addDep(found)
-		i.log.Debug("Field #", fi, "(", fName, "): Populating the field in type ", c.tp, " by component ", found.tp)
-		return
-	}
-
-	// If nothing is found, apply default value if it's possible.
-	if tagInfo.optional {
-		err := setFieldValueByString(f, tagInfo.defVal)
-		if err != nil {
-			i.panic(fmt.Sprintf("Could not assign the default value=\"%s\" to the field %s (with type %s) in the type %s.",
-				tagInfo.defVal, fName, fType, c.tp))
-		}
-
-		i.log.Info("Field #", fi, "(", fName, "): the component name ", compName, ", is not found, but the field population is optional. Skipping the value. ")
-		return
-	}
-
-	i.panic(fmt.Sprintf("Could not find a component to initialize field %s (with type %s) in the type %s", fName, fType, c.tp))
-}
-
-func (i *Injector) initStructPtr(c *component) {
-	if !isStructPtr(c.tp) {
-		i.log.Debug("Skipping component with type ", c.tp, " cause it is not a pointer to a struct")
-		return
-	}
-
-	i.log.Debug("Init component with type ", c.tp, " (", c.val.Elem().NumField(), " fields)")
-
-	for fi := 0; fi < c.val.Elem().NumField(); fi++ {
-		f := c.val.Elem().Field(fi)
-		fType := f.Type()
-		fTag := string(c.tp.Elem().Field(fi).Tag)
-		fName := c.tp.Elem().Field(fi).Name
-
-		tagInfo, err := parseTag(i.tagName, fTag)
-		if err == errTagNotFound {
-			i.log.Debug("Field #", fi, "(", fName, "): no tags for the field ", fType)
-			continue
-		}
-
-		if err != nil {
-			i.panic(fmt.Sprintf("Could not parse tag for field %s of %s, err=%s.", fName, c.tp, err))
-		}
-
-		if !f.CanSet() {
-			i.panic(fmt.Sprintf("Could not set field %s valued of %s, cause it is unexported.", fName, c.tp))
-		}
-
-		i.assignOrPanic(c, fi, tagInfo)
-	}
+	return found
 }
 
 func (i *Injector) panic(err string) {
@@ -380,6 +357,20 @@ func isStructPtr(t reflect.Type) bool {
 	return t.Kind() == reflect.Ptr && t.Elem().Kind() == reflect.Struct
 }
 
+func (c *component) construct() {
+	in := make([]any, len(c.depSlice))
+	for idx, depC := range c.depSlice {
+		if depC != nil {
+			in[idx] = c.depSlice[idx].value
+		} else {
+			in[idx] = nil
+		}
+	}
+
+	c.value = c.comp.Produce(in)
+	c.val = reflect.ValueOf(c.value)
+}
+
 func (c *component) postConstruct(log Logger) {
 	if pc, ok := c.value.(PostConstructor); ok {
 		log.Info("PostConstruct() for ", c.tp, " priority=", c.initOrder)
@@ -391,7 +382,7 @@ func (c *component) init(ctx context.Context, log Logger) (err error) {
 	defer func() {
 		r := recover()
 		if r != nil {
-			err = fmt.Errorf("Panic in Init() of %s recover=%v", c.tp, r)
+			err = fmt.Errorf("panic in Init() of %s recover=%v", c.tp, r)
 		}
 	}()
 
@@ -407,7 +398,7 @@ func (c *component) shutdown(log Logger) (err error) {
 	defer func() {
 		r := recover()
 		if r != nil {
-			err = fmt.Errorf("Panic in Shutdown() of %s", c.tp)
+			err = fmt.Errorf("panic in Shutdown() of %s", c.tp)
 		}
 	}()
 
@@ -421,9 +412,12 @@ func (c *component) shutdown(log Logger) (err error) {
 
 func (c *component) addDep(c1 *component) {
 	if c.deps == nil {
-		c.deps = make(map[*component]bool)
+		c.deps = make(map[*component]struct{})
 	}
-	c.deps[c1] = true
+	if c1 != nil {
+		c.deps[c1] = struct{}{}
+	}
+	c.depSlice = append(c.depSlice, c1)
 }
 
 func (c *component) getInitOrder() int {
@@ -431,17 +425,17 @@ func (c *component) getInitOrder() int {
 		return c.initOrder
 	}
 
-	blkList := make(map[*component]bool)
+	blkList := make(map[*component]struct{})
 	return c.setInitOrder(blkList)
 }
 
-func (c *component) setInitOrder(blkList map[*component]bool) int {
+func (c *component) setInitOrder(blkList map[*component]struct{}) int {
 	if c.initOrder > 0 {
 		return c.initOrder
 	}
 
 	o := 1
-	blkList[c] = true
+	blkList[c] = struct{}{}
 	for c1 := range c.deps {
 		if _, ok := blkList[c1]; ok {
 			panic(fmt.Sprintf("Found a loop in the object graph dependencies. Component %s has a reference to %s, which alrady refers to the first one directly or indirectly",
@@ -459,27 +453,4 @@ func (c *component) setInitOrder(blkList map[*component]bool) int {
 
 func (c *component) String() string {
 	return fmt.Sprintf("{tp=%s, }", c.tp)
-}
-
-// setFieldValueByString receives a field value and a string which should be assignde to
-// it. Numberical and string values are supported only. Returns an error if
-// it could not assign the string value to the field
-func setFieldValueByString(field reflect.Value, s string) error {
-	if len(s) == 0 {
-		return nil
-	}
-
-	obj := reflect.New(field.Type()).Interface()
-	if t := reflect.TypeOf(obj); t.Kind() == reflect.Ptr &&
-		t.Elem().Kind() == reflect.String {
-		s = strconv.Quote(s)
-	}
-
-	err := json.Unmarshal([]byte(s), obj)
-	if err != nil {
-		return err
-	}
-
-	field.Set(reflect.ValueOf(obj).Elem())
-	return nil
 }

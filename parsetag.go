@@ -15,6 +15,7 @@
 package linker
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 )
@@ -25,12 +26,12 @@ type parseRes struct {
 	defVal   string
 }
 
-var errTagNotFound = fmt.Errorf("Tag not found")
+var errTagNotFound = errors.New("tag not found")
 
 // parseTag receives a tag name and the tags strings. The tag in the tags is expected
 // to be for example:
 //
-// 	`inject: "componentName, optional: \"abc\"", anotherTag:...`
+//	`inject: "componentName, optional: \"abc\"", anotherTag:...`
 //
 // the tag name separated by collon with its value. Value must be quoted.
 // tag value consists of its fields, which are comma separated. The result contains
@@ -48,7 +49,7 @@ func parseTag(name, tags string) (parseRes, error) {
 	tags = tags[i+len(name):]
 	tags = strings.TrimLeft(tags, " ")
 	if len(tags) == 0 || tags[0] != ':' {
-		return parseRes{}, fmt.Errorf("Found the tag name=%s, but could not found semicolon after the tag name", name)
+		return parseRes{}, fmt.Errorf("found the tag name=%s, but could not found semicolon after the tag name", name)
 	}
 	tags = strings.TrimLeft(tags[1:], " ")
 
@@ -63,7 +64,7 @@ func parseTag(name, tags string) (parseRes, error) {
 		}
 	}
 	if i >= len(tags) {
-		return parseRes{}, fmt.Errorf("tag value expected to be in qoutes, but closing quote is not found.")
+		return parseRes{}, fmt.Errorf("tag value expected to be in qoutes, but closing quote is not found")
 	}
 
 	tags = tags[:i]
@@ -75,7 +76,8 @@ func parseTag(name, tags string) (parseRes, error) {
 // parseParams receives slice of string params and turns them into parseParams fields
 // supported params:
 // optional - if found, then optional field is set true. It can contain
-//  default value after a collon if provided.
+//
+//	default value after a collon if provided.
 func (pr *parseRes) parseParams(params []string) error {
 	if len(params) == 0 {
 		// empty params, does nothing
@@ -99,7 +101,7 @@ func (pr *parseRes) parseParams(params []string) error {
 			}
 			continue
 		}
-		return fmt.Errorf("Unknown parameter in the tag value: %s. \"optional\" supported so far.", params[i])
+		return fmt.Errorf("unknown parameter in the tag value: %s. \"optional\" supported so far", params[i])
 	}
 
 	return nil
